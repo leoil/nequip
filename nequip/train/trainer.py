@@ -11,6 +11,8 @@ import sys
 import inspect
 import logging
 import yaml
+import cosine_annealing_warmup
+
 from copy import deepcopy
 from os.path import isfile
 from time import perf_counter
@@ -208,10 +210,6 @@ class Trainer:
        final_callbacks
     ```
     """
-
-    lr_scheduler_module = torch.optim.lr_scheduler
-    optim_module = torch.optim
-
     def __init__(
         self,
         model,
@@ -266,6 +264,8 @@ class Trainer:
         self.model = model
         self.optim = optim
         self.lr_sched = lr_sched
+        self.lr_sched_module = cosine_annealing_warmup if lr_scheduler_name == "CosineAnnealingWarmupRestarts" else torch.optim.lr_scheduler
+        optim_module = torch.optim
 
         _local_kwargs = {}
         for key in self.init_params:
@@ -564,7 +564,7 @@ class Trainer:
         if self.lr_sched is None:
             assert (
                 self.lr_scheduler_name
-                in ["CosineAnnealingWarmRestarts", "ReduceLROnPlateau", "none"]
+                in ["CosineAnnealingWarmupRestarts", "ReduceLROnPlateau", "CosineAnnealingWarmupRestarts", "none"]
             ) or (
                 (len(self.end_of_epoch_callbacks) + len(self.end_of_batch_callbacks))
                 > 0
@@ -573,7 +573,7 @@ class Trainer:
             self.lr_scheduler_kwargs = {}
             if self.lr_scheduler_name != "none":
                 self.lr_sched, self.lr_scheduler_kwargs = instantiate_from_cls_name(
-                    module=torch.optim.lr_scheduler,
+                    module=self.lr_sched_module,
                     class_name=self.lr_scheduler_name,
                     prefix="lr_scheduler",
                     positional_args=dict(optimizer=self.optim),
@@ -725,7 +725,7 @@ class Trainer:
             if self.use_ema:
                 self.ema.update()
 
-            if self.lr_scheduler_name == "CosineAnnealingWarmRestarts":
+            if self.lr_scheduler_name == "CosineAnnealingWarmupRestarts":
                 self.lr_sched.step(self.iepoch + self.ibatch / self.n_batches)
 
         with torch.no_grad():
@@ -811,6 +811,9 @@ class Trainer:
 
         if self.lr_scheduler_name == "ReduceLROnPlateau":
             self.lr_sched.step(metrics=self.mae_dict[self.metrics_key])
+
+        if self.lr_scheduler_name == "CosineAnnealingWarmupRestarts":
+            self.lr_sched.step()
 
         for callback in self.end_of_epoch_callbacks:
             callback(self)
