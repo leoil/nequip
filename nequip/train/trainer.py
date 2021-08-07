@@ -564,7 +564,7 @@ class Trainer:
         if self.lr_sched is None:
             assert (
                 self.lr_scheduler_name
-                in ["CosineAnnealingWarmupRestarts", "ReduceLROnPlateau", "CosineAnnealingWarmupRestarts", "none"]
+                in ["CosineAnnealingWarmRestarts", "ReduceLROnPlateau", "CosineAnnealingWarmupRestarts", "none"]
             ) or (
                 (len(self.end_of_epoch_callbacks) + len(self.end_of_batch_callbacks))
                 > 0
@@ -725,7 +725,7 @@ class Trainer:
             if self.use_ema:
                 self.ema.update()
 
-            if self.lr_scheduler_name == "CosineAnnealingWarmupRestarts":
+            if self.lr_scheduler_name == "CosineAnnealingWarmRestarts":
                 self.lr_sched.step(self.iepoch + self.ibatch / self.n_batches)
 
         with torch.no_grad():
