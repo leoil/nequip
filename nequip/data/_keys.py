@@ -39,6 +39,9 @@ PER_ATOM_ENERGY_KEY: Final[str] = "atomic_energy"
 TOTAL_ENERGY_KEY: Final[str] = "total_energy"
 FORCE_KEY: Final[str] = "forces"
 
+PER_ATOM_CHARGE_KEY: Final[str] = "partial_charge"
+DIPOLE_KEY: Final[str] = "dipole"
+
 BATCH_KEY: Final[str] = "batch"
 
 # Make a list of allowed keys
