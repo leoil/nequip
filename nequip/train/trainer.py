@@ -10,10 +10,9 @@ make an interface with ray
 import sys
 import inspect
 import logging
-import yaml
 from copy import deepcopy
 from os.path import isfile
-from time import perf_counter, gmtime, strftime
+from time import perf_counter
 from typing import Callable, Optional, Union, Tuple, List
 from pathlib import Path
 
@@ -40,6 +39,7 @@ from nequip.utils import (
     atomic_write,
     dtype_from_name,
 )
+from nequip.utils.git import get_commit
 from nequip.model import model_from_config
 
 from .loss import Loss, LossStat
@@ -170,14 +170,13 @@ class Trainer:
     Additional Attributes:
 
         init_keys (list): list of parameters needed to reconstruct this instance
-        device : torch device
         dl_train (DataLoader): training data
         dl_val (DataLoader): test data
         iepoch (int): # of epoches ran
         stop_arg (str): reason why the training stops
         batch_mae (float): the mae of the latest batch
         mae_dict (dict): all loss, mae of the latest validation
-        best_val_metrics (float): current best validation mae
+        best_metrics (float): current best validation mae
         best_epoch (float): current best epoch
         best_model_path (str): path to save the best model
         last_model_path (str): path to save the latest model
@@ -213,11 +212,12 @@ class Trainer:
         self,
         model,
         model_builders: Optional[list] = [],
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
         seed: Optional[int] = None,
         loss_coeffs: Union[dict, str] = AtomicDataDict.TOTAL_ENERGY_KEY,
         train_on_keys: Optional[List[str]] = None,
         metrics_components: Optional[Union[dict, str]] = None,
-        metrics_key: str = ABBREV.get(LOSS_KEY, LOSS_KEY),
+        metrics_key: str = f"{VALIDATION}_" + ABBREV.get(LOSS_KEY, LOSS_KEY),
         early_stopping_conds: Optional[EarlyStopping] = None,
         early_stopping: Optional[Callable] = None,
         early_stopping_kwargs: Optional[dict] = None,
@@ -275,8 +275,12 @@ class Trainer:
             "metrics_initialization.csv", propagate=False
         )
         self.batch_log = {
-            TRAIN: output.open_logfile("metrics_batch_train.csv", propagate=False),
-            VALIDATION: output.open_logfile("metrics_batch_val.csv", propagate=False),
+            TRAIN: output.open_logfile(
+                f"metrics_batch_{ABBREV[TRAIN]}.csv", propagate=False
+            ),
+            VALIDATION: output.open_logfile(
+                f"metrics_batch_{ABBREV[VALIDATION]}.csv", propagate=False
+            ),
         }
 
         # add filenames if not defined
@@ -289,8 +293,8 @@ class Trainer:
             torch.manual_seed(seed)
             np.random.seed(seed)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.logger.info(f"Torch device: {self.device}")
+        self.torch_device = torch.device(self.device)
 
         # sort out all the other parameters
         # for samplers, optimizer and scheduler
@@ -300,7 +304,7 @@ class Trainer:
         self.early_stopping_kwargs = deepcopy(early_stopping_kwargs)
 
         # initialize training states
-        self.best_val_metrics = float("inf")
+        self.best_metrics = float("inf")
         self.best_epoch = 0
         self.iepoch = -1 if self.report_init_validation else 0
 
@@ -368,9 +372,9 @@ class Trainer:
                 new_dict = {}
                 for k, v in item.items():
                     if (
-                        k.startswith(VALIDATION)
-                        or k.startswith(TRAIN)
-                        or k in ["LR", "wall"]
+                        k.lower().startswith(VALIDATION)
+                        or k.lower().startswith(TRAIN)
+                        or k.lower() in ["lr", "wall"]
                     ):
                         new_dict[k] = item[k]
                     else:
@@ -385,6 +389,13 @@ class Trainer:
                 decay=self.ema_decay,
                 use_num_updates=self.ema_use_num_updates,
             )
+
+        if hasattr(self.model, "irreps_out"):
+            for key in self.train_on_keys:
+                if key not in self.model.irreps_out:
+                    raise RuntimeError(
+                        "Loss function include fields that are not predicted by the model"
+                    )
 
     @property
     def init_keys(self):
@@ -444,15 +455,15 @@ class Trainer:
             dictionary["state_dict"]["rng_state"] = torch.get_rng_state()
             if torch.cuda.is_available():
                 dictionary["state_dict"]["cuda_rng_state"] = torch.cuda.get_rng_state(
-                    device=self.device
+                    device=self.torch_device
                 )
 
         if training_progress:
             dictionary["progress"] = {}
             for key in ["iepoch", "best_epoch"]:
                 dictionary["progress"][key] = self.__dict__.get(key, -1)
-            dictionary["progress"]["best_val_metrics"] = self.__dict__.get(
-                "best_val_metrics", float("inf")
+            dictionary["progress"]["best_metrics"] = self.__dict__.get(
+                "best_metrics", float("inf")
             )
             dictionary["progress"]["stop_arg"] = self.__dict__.get("stop_arg", None)
 
@@ -465,6 +476,8 @@ class Trainer:
 
         for code in [e3nn, nequip, torch]:
             dictionary[f"{code.__name__}_version"] = code.__version__
+        for code in ["e3nn", "nequip"]:
+            dictionary[f"{code}_commit"] = get_commit(code)
 
         return dictionary
 
@@ -595,11 +608,11 @@ class Trainer:
                 torch.cuda.set_rng_state(state_dict["cuda_rng_state"])
 
         if "progress" in d:
-            trainer.best_val_metrics = progress["best_val_metrics"]
+            trainer.best_metrics = progress["best_metrics"]
             trainer.best_epoch = progress["best_epoch"]
             stop_arg = progress.pop("stop_arg", None)
         else:
-            trainer.best_val_metrics = float("inf")
+            trainer.best_metrics = float("inf")
             trainer.best_epoch = 0
             stop_arg = None
         trainer.iepoch = iepoch
@@ -632,7 +645,10 @@ class Trainer:
             if model is not None:
                 # TODO: this is not exactly equivalent to building with
                 # this set as default dtype... does it matter?
-                model.to(device=device, dtype=dtype_from_name(config.default_dtype))
+                model.to(
+                    device=torch.device(device),
+                    dtype=dtype_from_name(config.default_dtype),
+                )
                 model_state_dict = torch.load(
                     traindir + "/" + model_name, map_location=device
                 )
@@ -644,7 +660,7 @@ class Trainer:
         if self.model is None:
             return
 
-        self.model.to(self.device)
+        self.model.to(self.torch_device)
         self.init_objects()
 
         self._initialized = True
@@ -654,7 +670,7 @@ class Trainer:
             self.metrics_components = []
             for key, func in self.loss.funcs.items():
                 params = {
-                    "PerSpecies": type(func).__name__.startswith("PerSpecies"),
+                    "PerSpecies": type(func).__name__.lower().startswith("perspecies"),
                 }
                 self.metrics_components.append((key, "mae", params))
                 self.metrics_components.append((key, "rmse", params))
@@ -667,10 +683,12 @@ class Trainer:
         )
 
         if not (
-            self.metrics_key.startswith(VALIDATION)
-            or self.metrics_key.startswith(TRAIN)
+            self.metrics_key.lower().startswith(VALIDATION)
+            or self.metrics_key.lower().startswith(TRAIN)
         ):
-            self.metrics_key = f"{VALIDATION}_{self.metrics_key}"
+            raise RuntimeError(
+                f"metrics_key should start with either {VALIDATION} or {TRAIN}"
+            )
 
     def train(self):
 
@@ -718,7 +736,7 @@ class Trainer:
             self.model.train()
 
         # Do any target rescaling
-        data = data.to(self.device)
+        data = data.to(self.torch_device)
         data = AtomicData.to_AtomicDataDict(data)
 
         if hasattr(self.model, "unscale"):
@@ -807,9 +825,9 @@ class Trainer:
 
     def reset_metrics(self):
         self.loss_stat.reset()
-        self.loss_stat.to(self.device)
+        self.loss_stat.to(self.torch_device)
         self.metrics.reset()
-        self.metrics.to(self.device)
+        self.metrics.to(self.torch_device)
 
     def epoch_step(self):
 
@@ -909,15 +927,15 @@ class Trainer:
         save model and trainer details
         """
 
-        val_metrics = self.mae_dict[self.metrics_key]
-        if val_metrics < self.best_val_metrics:
-            self.best_val_metrics = val_metrics
+        current_metrics = self.mae_dict[self.metrics_key]
+        if current_metrics < self.best_metrics:
+            self.best_metrics = current_metrics
             self.best_epoch = self.iepoch
 
             self.save_ema_model(self.best_model_path)
 
             self.logger.info(
-                f"! Best model {self.best_epoch:8d} {self.best_val_metrics:8.3f}"
+                f"! Best model {self.best_epoch:8d} {self.best_metrics:8.3f}"
             )
 
         if (self.iepoch + 1) % self.log_epoch_freq == 0:
@@ -1045,6 +1063,9 @@ class Trainer:
 
     def __del__(self):
 
+        if not self._initialized:
+            return
+
         logger = self.logger
         for hdl in logger.handlers:
             hdl.flush()
@@ -1126,7 +1147,7 @@ class Trainer:
                 self.dataloader_num_workers > 0 and self.max_epochs > 1
             ),
             # PyTorch recommends this for GPU since it makes copies much faster
-            pin_memory=(self.device != torch.device("cpu")),
+            pin_memory=(self.torch_device != torch.device("cpu")),
             # avoid getting stuck
             timeout=(10 if self.dataloader_num_workers > 0 else 0),
         )

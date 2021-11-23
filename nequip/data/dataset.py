@@ -2,7 +2,6 @@ import numpy as np
 import logging
 import tempfile
 import inspect
-from torch._C import Value
 import yaml
 import hashlib
 from os.path import dirname, basename, abspath
@@ -12,7 +11,8 @@ import ase
 
 import torch
 
-from torch_scatter import scatter, scatter_std
+from torch_runstats.scatter import scatter_std, scatter_mean
+
 from nequip.utils.torch_geometric import Batch, Dataset
 from nequip.utils.torch_geometric.utils import download_url, extract_zip
 
@@ -26,7 +26,7 @@ from nequip.data import (
 )
 from nequip.utils.batch_ops import bincount
 from nequip.utils.regressor import solver
-from ._util import _TORCH_INTEGER_DTYPES
+from nequip.utils.savenload import atomic_write
 from .transforms import TypeMapper
 
 
@@ -295,9 +295,19 @@ class AtomicInMemoryDataset(AtomicDataset):
 
         logging.info(f"Loaded data: {data}")
 
-        torch.save((data, fixed_fields, self.include_frames), self.processed_paths[0])
-        with open(self.processed_paths[1], "w") as f:
-            yaml.dump(self._get_parameters(), f)
+        # use atomic writes to avoid race conditions between
+        # different trainings that use the same dataset
+        # since those separate trainings should all produce the same results,
+        # it doesn't matter if they overwrite each others cached'
+        # datasets. It only matters that they don't simultaneously try
+        # to write the _same_ file, corrupting it.
+        with atomic_write(self.processed_paths[0]) as tmppth:
+            torch.save((data, fixed_fields, self.include_frames), tmppth)
+        with atomic_write(self.processed_paths[1]) as tmppth:
+            with open(tmppth, "w") as f:
+                yaml.dump(self._get_parameters(), f)
+
+        logging.info("Cached processed data to disk")
 
         self.data = data
         self.fixed_fields = fixed_fields
@@ -574,11 +584,11 @@ class AtomicInMemoryDataset(AtomicDataset):
             arr = arr.type(torch.get_default_dtype())
 
             if ana_mode == "mean_std":
-                mean = scatter(arr, atom_types, reduce="mean", dim=0)
+                mean = scatter_mean(arr, atom_types, dim=0)
                 std = scatter_std(arr, atom_types, dim=0, unbiased=unbiased)
                 return mean, std
             elif ana_mode == "rms":
-                square = scatter(arr.square(), atom_types, reduce="mean", dim=0)
+                square = scatter_mean(arr.square(), atom_types, dim=0)
                 dims = len(square.shape) - 1
                 for i in range(dims):
                     square = square.mean(axis=-1)

@@ -3,7 +3,6 @@ import pytest
 import logging
 import tempfile
 import torch
-from os.path import isfile
 
 import numpy as np
 
@@ -139,7 +138,9 @@ class TestWorkflow:
         model_script = script(instance)
 
         assert torch.allclose(
-            instance(data)[out_field], model_script(data)[out_field], atol=1e-7
+            instance(data)[out_field],
+            model_script(data)[out_field],
+            atol=1e-6,
         )
 
         # - Try saving, loading in another process, and running -
